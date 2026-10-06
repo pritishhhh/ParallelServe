@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -84,3 +85,23 @@ def test_measure_separates_warmup_and_failures(monkeypatch):
 def test_invalid_benchmark_settings(argv):
     with pytest.raises(SystemExit):
         load_test.parse_args(argv)
+
+
+def test_partial_measurements_survive_cleanup_failure(tmp_path, monkeypatch):
+    weights = tmp_path / "model.pt"
+    weights.write_bytes(b"test weights")
+    monkeypatch.setattr(load_test, "MODEL_PATH", str(weights))
+    args = SimpleNamespace(output_dir=tmp_path / "results", workers=2)
+    monkeypatch.setattr(load_test, "parse_args", lambda _: args)
+    monkeypatch.setattr(load_test, "start_server", lambda *args: (object(), "unused"))
+    monkeypatch.setattr(load_test, "measure", lambda *args: {"failed": 0, "successful": 2})
+
+    def cleanup(proc):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(load_test, "stop_server", cleanup)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        load_test.main([])
+    document = json.loads((args.output_dir / "benchmark_results.json").read_text())
+    assert document["results"]["single_no_batch"]["successful"] == 2
+    assert len(document["model"]["sha256"]) == 64

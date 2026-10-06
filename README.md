@@ -173,8 +173,8 @@ python benchmarks/load_test.py --concurrency 8 --requests-per-client 5 --workers
 The benchmark starts and cleans up an isolated local server for each of four
 configurations: one/multiple workers, batching off/on. It warms up first and
 records successful throughput, p50/p95/p99 client latency, failures, accuracy,
-mean batch size, parameters, and environment information. Failed HTTP responses
-and malformed results do not count toward throughput. The benchmark exits with
+mean batch size, parameters, model-weight checksum, and environment information.
+Failed HTTP responses and malformed results do not count toward throughput. The benchmark exits with
 a nonzero status when measured requests fail.
 
 Results, charts, and per-configuration server logs are written to

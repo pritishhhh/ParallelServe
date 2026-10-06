@@ -1,0 +1,86 @@
+{
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.6",
+    "torch": "2.14.1+cpu",
+    "cpu_count": 16
+  },
+  "model": {
+    "weights_name": "model_weights.pt",
+    "sha256": "10521d7508d5cf4edb449f4b4fa10b09a35da2c42009ba5d64f48d44d235e54b"
+  },
+  "configuration": {
+    "concurrency": 50,
+    "requests_per_client": 20,
+    "workers": 4,
+    "batch_size": 16,
+    "window_ms": 1.0,
+    "torch_threads": 1,
+    "warmup": 3,
+    "timeout": 15,
+    "startup_timeout": 60,
+    "output_dir": "benchmarks\\results\\verified-1ms"
+  },
+  "results": {
+    "single_no_batch": {
+      "workers": 1,
+      "batching": false,
+      "attempted": 1000,
+      "successful": 1000,
+      "failed": 0,
+      "errors": {},
+      "duration_s": 1.498,
+      "throughput_rps": 667.45,
+      "p50_ms": 58.066,
+      "p95_ms": 96.506,
+      "p99_ms": 120.608,
+      "accuracy": 1.0,
+      "mean_batch_size": 1.0
+    },
+    "single_batch": {
+      "workers": 1,
+      "batching": true,
+      "attempted": 1000,
+      "successful": 1000,
+      "failed": 0,
+      "errors": {},
+      "duration_s": 1.496,
+      "throughput_rps": 668.29,
+      "p50_ms": 58.842,
+      "p95_ms": 97.25,
+      "p99_ms": 118.77,
+      "accuracy": 1.0,
+      "mean_batch_size": 11.14
+    },
+    "multi_no_batch": {
+      "workers": 4,
+      "batching": false,
+      "attempted": 1000,
+      "successful": 1000,
+      "failed": 0,
+      "errors": {},
+      "duration_s": 1.513,
+      "throughput_rps": 661.13,
+      "p50_ms": 59.235,
+      "p95_ms": 99.223,
+      "p99_ms": 116.864,
+      "accuracy": 1.0,
+      "mean_batch_size": 1.0
+    },
+    "multi_batch": {
+      "workers": 4,
+      "batching": true,
+      "attempted": 1000,
+      "successful": 1000,
+      "failed": 0,
+      "errors": {},
+      "duration_s": 1.537,
+      "throughput_rps": 650.67,
+      "p50_ms": 60.744,
+      "p95_ms": 96.748,
+      "p99_ms": 110.542,
+      "accuracy": 1.0,
+      "mean_batch_size": 2.708
+    }
+  }
+}

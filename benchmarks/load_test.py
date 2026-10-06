@@ -6,6 +6,7 @@ Results include failures, accuracy, batching, configuration and environment.
 
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import platform
@@ -22,6 +23,7 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+from model import MODEL_PATH  # noqa: E402
 from sample_input import make_payload  # noqa: E402
 
 
@@ -42,9 +44,16 @@ def stop_server(proc):
         proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
         if os.name == "nt":
-            subprocess.run(
+            cleanup = subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"], check=False, capture_output=True
             )
+            if cleanup.returncode and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+                raise RuntimeError(
+                    "Could not stop the benchmark process tree: "
+                    + cleanup.stderr.decode(errors="replace").strip()
+                )
         else:
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(timeout=5)
@@ -230,6 +239,20 @@ def main(argv=None):
     args = parse_args(argv)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
+    with open(MODEL_PATH, "rb") as weights:
+        model_hash = hashlib.file_digest(weights, "sha256").hexdigest()
+    document = {
+        "environment": {
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cpu_count": os.cpu_count(),
+        },
+        "model": {"weights_name": Path(MODEL_PATH).name, "sha256": model_hash},
+        "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        "results": results,
+    }
+    output = args.output_dir / "benchmark_results.json"
     configurations = [
         ("single_no_batch", 1, False),
         ("single_batch", 1, True),
@@ -242,20 +265,12 @@ def main(argv=None):
             try:
                 results[name] = {"workers": workers, "batching": batching, **measure(url, args)}
             finally:
-                stop_server(proc)
+                try:
+                    stop_server(proc)
+                finally:
+                    # Preserve completed measurements even if cleanup later fails.
+                    output.write_text(json.dumps(document, indent=2), encoding="utf-8")
         print(f"{name}: {results[name]}")
-    document = {
-        "environment": {
-            "platform": platform.platform(),
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "cpu_count": os.cpu_count(),
-        },
-        "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        "results": results,
-    }
-    output = args.output_dir / "benchmark_results.json"
-    output.write_text(json.dumps(document, indent=2), encoding="utf-8")
     plot(results, args.output_dir)
     print(f"Saved results to {output}")
     return 1 if any(r["failed"] for r in results.values()) else 0

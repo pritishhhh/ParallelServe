@@ -71,7 +71,9 @@ Configure its threshold above the maximum legitimate execution time.
 
 ## Verification
 
-The repository contains tests for the failure modes above and a CI matrix for
-Windows/Linux and Python 3.11/3.12. The change description records the actual local
-test results and benchmark parameters. Synthetic accuracy and short benchmark
-measurements are smoke evidence, not a production performance guarantee.
+The regression suite passes locally on Windows/Python 3.12, including real
+PyTorch inference and HTTP lifecycle tests. GitHub Actions also verified the
+runtime changes on Windows/Linux with Python 3.11/3.12. See the pull request for
+the latest checks and [recorded benchmark verification](benchmarks/README.md) for
+parameters and results. Synthetic accuracy and short benchmark measurements are
+smoke evidence, not a production performance guarantee.
