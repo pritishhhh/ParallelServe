@@ -1,114 +1,197 @@
-# ParallelServe — Distributed ML Inference Server
+# ParallelServe
 
-A multi-process, load-balanced inference server for machine learning models. This project provides the serving infrastructure to host models efficiently, demonstrating concepts like dynamic request batching, load balancing, and fault tolerance.
+A single-host, multi-process PyTorch inference server with dynamic batching,
+bounded request admission, least-loaded routing, and automatic worker recovery.
+The included CNN classifies synthetic 28×28 images into four geometric patterns.
 
 ## Architecture
 
-```
-                       ┌─────────────────────────┐
-   HTTP request  ───▶  │   FastAPI  (async)      │
-   POST /predict       │   /predict endpoint     │
-                       └────────────┬────────────┘
-                                    │  (blocking call, run in thread pool)
-                                    ▼
-                       ┌─────────────────────────┐
-                       │      Dispatcher         │
-                       │  - least-loaded routing │
-                       │  - health monitor       │
-                       │  - result listeners     │
-                       └──┬──────┬──────┬────────┘
-                          │      │      │  (each worker: own task_queue
-                          ▼      ▼      ▼   + own result_queue)
-                     ┌────────┐┌────────┐┌────────┐
-                     │Worker 0││Worker 1││Worker N│   ◀── separate OS
-                     │(process││(process││(process│       processes
-                     │ model  ││ model  ││ model  │       (bypasses GIL)
-                     │ loaded ││ loaded ││ loaded │
-                     └────────┘└────────┘└────────┘
-                          │
-                          ▼
-                  dynamic batching buffers 
-                  requests up to `batch_window_ms` 
-                  or `max_batch_size`, then
-                  runs ONE batched forward pass
+```text
+HTTP POST /predict
+        │ validate 784 finite pixels in [0, 1]
+        ▼
+FastAPI async endpoint ── await result Future (no thread per request)
+        │
+        ▼
+Dispatcher ── bounded admission + atomic least-loaded assignment
+        │          │          │
+        ▼          ▼          ▼
+Worker 0       Worker 1    Worker N    (separate spawned processes)
+model          model       model
+task/result    task/result task/result queues
+        │
+        ▼
+collect up to MAX_BATCH_SIZE within BATCH_WINDOW_MS
+skip expired requests → one batched inference → correlated results
+
+Supervisor: readiness tracking → crash/stall detection → cleanup → replacement
 ```
 
-## Features
+Workers become eligible for routing only after loading their models. Routing,
+assignment, and outstanding-work accounting share a lock, including during worker
+replacement. Async HTTP requests wait on result futures rather than occupying a
+large executor pool.
 
-1. **Process-level Parallelism**: Workers are separate OS processes, bypassing the Python GIL for CPU-bound inference tasks.
-2. **Dynamic Batching**: Buffers incoming requests and runs them as a single batch to maximize hardware utilization (similar to Triton/TorchServe).
-3. **Load Balancing**: Routes incoming requests to the worker with the fewest active tasks.
-4. **Fault Tolerance**: Background monitoring detects worker crashes and automatically respawns replacements without losing server availability.
+## Quick start
 
-## Running the Server
+Requires Python 3.11 or newer. Create and activate a virtual environment, then:
 
-Install dependencies and train the default model:
 ```bash
 pip install -r requirements.txt
-python model.py                 # trains and saves the default CNN
+python model.py
+uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
-Start the inference server:
+For CPU-only environments, install the CPU build of PyTorch first:
+
 ```bash
-NUM_WORKERS=4 uvicorn server:app --host 0.0.0.0 --port 8000
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
 ```
 
-Send a request:
-```bash
-curl localhost:8000/health
+In another terminal:
 
-# Using the provided predict script:
+```bash
 python predict.py --n 5
+curl http://127.0.0.1:8000/health
 ```
 
-### Configuration
+To change settings on Bash:
 
-| Environment Variable | Default | Description |
+```bash
+NUM_WORKERS=2 BATCH_WINDOW_MS=4 uvicorn server:app --port 8000
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:NUM_WORKERS = "2"
+$env:BATCH_WINDOW_MS = "4"
+uvicorn server:app --port 8000
+```
+
+Run one Uvicorn process: `NUM_WORKERS` already controls inference parallelism.
+Adding Uvicorn `--workers` creates another full model pool per HTTP process and
+multiplies memory consumption and configured admission limits.
+
+## Configuration
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `NUM_WORKERS` | 4 | Number of worker processes to spawn |
-| `ENABLE_BATCHING` | 1 | Set to 0 to disable dynamic batching |
-| `MAX_BATCH_SIZE` | 16 | Maximum requests per batch |
-| `BATCH_WINDOW_MS` | 8.0 | Max wait time to accumulate a batch |
+| `NUM_WORKERS` | `4` | Positive number of inference processes |
+| `ENABLE_BATCHING` | `1` | Exactly `0` or `1` |
+| `MAX_BATCH_SIZE` | `16` | Positive maximum requests per batch |
+| `BATCH_WINDOW_MS` | `8` | Finite, nonnegative batching wait; `0` drains immediately available work |
+| `MAX_PENDING_REQUESTS` | `256` | Maximum queued/executing requests across the pool |
+| `REQUEST_TIMEOUT_S` | `5` | Finite, positive HTTP prediction deadline |
+| `STARTUP_TIMEOUT_S` | `30` | Finite, positive model-loading deadline |
+| `WORKER_TIMEOUT_S` | `30` | Finite, positive time without results while a worker has outstanding work before replacing it |
+| `TORCH_THREADS` | `1` | Positive PyTorch compute threads per worker; also used for sample training |
+| `MODEL_PATH` | `model_weights.pt` beside `model.py` | Path to model weights; relative paths resolve from the working directory |
 
-## Default Model (Sample)
+Invalid settings fail startup. The default of one PyTorch compute thread per
+worker prevents each worker from creating a full CPU-sized compute pool. Tune
+this alongside worker count for your hardware and model. Set `WORKER_TIMEOUT_S`
+above the longest legitimate model batch execution time.
 
-To make this project fully self-contained, a lightweight sample PyTorch model is included out of the box.
+## HTTP behavior
 
-- **`model.py`**: Defines a small Convolutional Neural Network (CNN) that classifies synthetic 28x28 grayscale images into 4 distinct geometric patterns (e.g., horizontal stripes, checkerboard).
-- Running `python model.py` automatically generates synthetic data, trains the CNN, and saves the learned weights to **`model_weights.pt`**.
-- **`sample_input.py`**: A utility script to generate sample image payloads that match the model's expected input shape for testing.
+`POST /predict` accepts `{"pixels": [...]}` containing exactly 784 numeric,
+finite values between zero and one. Predictions return a request ID, predicted
+class, confidence, worker ID, actual batch size, and timing fields:
 
-**Note:** This default model is just a placeholder to demonstrate the serving infrastructure. The server is completely agnostic to the model's architecture — **any ML model can be inserted** into this serving layer.
+- `queue_wait_ms`: time from admission until the forward pass begins, including
+  batching and tensor preparation; excludes inference itself.
+- `inference_ms`: time for the batched model forward pass and classification.
+- `total_latency_ms`: time within the endpoint after input validation, including
+  result delivery; clients should measure their own network latency.
 
-## Swapping in your own Model
+| Response | Meaning |
+|---|---|
+| `200` | Successful prediction |
+| `422` | Invalid input |
+| `503` + `Retry-After: 1` | Queue full, worker failure, or no ready workers |
+| `504` | Prediction deadline exceeded |
+| `500` | Model inference failed; traceback is logged on the worker |
 
-The serving infrastructure is decoupled from the ML model. The server treats the model as a black box function.
+`GET /health` reports ready worker count, configured count, outstanding requests,
+and capacity. It returns `200` with `ok` for a full pool, `200` with `degraded`
+while at least one worker can serve, or `503` with `unavailable` when none can.
+`GET /live` checks the HTTP process independently of model availability.
 
-To serve your own PyTorch model, modify `model.py`:
+Requests assigned to a crashed or stalled worker fail promptly with `503`.
+Other ready workers continue serving and replacements load before receiving
+traffic. There is no automatic replay or guarantee of zero request loss: clients
+may retry idempotent predictions. A deadline/cancellation does not interrupt a
+forward pass already executing. Outstanding capacity is retained until the
+worker consumes that task or the supervisor retires the worker, so repeated
+timeouts cannot accumulate unlimited work. Expired queued tasks skip inference.
+Shutdown wakes waiters, stops supervision, and joins or terminates workers.
 
-**1. Replace `TinyCNN` with your model class:**
-```python
-# In model.py
-class MyModel(nn.Module): 
-    # your existing architecture
-    ...
+## Model contract
+
+`model.py` contains a lightweight CNN, a synthetic dataset, and reproducible
+sample training. `python model.py` creates local weights, excluded from Git.
+Only load weights from a trusted source; the loader uses `weights_only=True`.
+
+To use another classifier:
+
+1. Replace `TinyCNN` and `load_model()` with your architecture and weight loader.
+2. Update the request schema and array shaping in `server.py` for its input.
+3. Adapt preprocessing and output decoding in `worker._process_batch` when needed.
+
+The current worker expects NumPy inputs stackable into a batch and a CPU PyTorch
+model returning finite `[batch, classes]` logits. GPU placement, non-classification
+outputs, variable input shapes, and other frameworks require adapter changes.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+python -m ruff check .
+python -m ruff format --check .
 ```
 
-**2. Update `load_model()` to load your weights:**
-```python
-def load_model():
-    model = MyModel() 
-    model.load_state_dict(torch.load("your_weights.pth", map_location="cpu"))
-    model.eval()
-    return model
+Tests exercise concurrent result routing, real spawned PyTorch workers, actual
+batching, HTTP lifecycle, input validation, overload, cancellation, deadlines,
+worker death/stalls, startup failure, recovery, and resource cleanup. Test model
+weights are generated in temporary directories; training a model or starting an
+external server is not required. GitHub Actions runs on Windows and Linux with
+Python 3.11 and 3.12.
+
+## Benchmarks
+
+Train the sample model first, then:
+
+```bash
+python benchmarks/load_test.py
+# Shorter run:
+python benchmarks/load_test.py --concurrency 8 --requests-per-client 5 --workers 2
 ```
 
-**3. Adjust the input dimensions:**
-Update `IMG_SIZE` (or modify `PredictRequest` in `server.py` to match your input format).
+The benchmark starts and cleans up an isolated local server for each of four
+configurations: one/multiple workers, batching off/on. It warms up first and
+records successful throughput, p50/p95/p99 client latency, failures, accuracy,
+mean batch size, parameters, model-weight checksum, and environment information.
+Failed HTTP responses and malformed results do not count toward throughput. The benchmark exits with
+a nonzero status when measured requests fail.
 
-Everything else — request queuing, batching, load balancing, and fault tolerance — will continue to work automatically.
+Results, charts, and per-configuration server logs are written to
+`benchmarks/results/` (ignored by Git); choose another location with `--output-dir`.
+Batching trades extra waiting time for compute efficiency. Small models, low
+concurrency, process/serialization overhead, and distributing traffic across too
+many workers can outweigh its benefits. Compare on your actual deployment
+hardware before choosing settings.
 
-## Tests and Benchmarks
+## Scope and next steps
 
-- **Fault tolerance**: Run `python test_fault_tolerance.py` to simulate a worker crash and verify auto-recovery.
-- **Benchmarking**: Run `python benchmarks/load_test.py` to measure throughput and latency across different configurations (batching vs non-batching, single vs multi-worker).
+This is serving infrastructure for one machine, with local multiprocessing
+queues. It does not yet coordinate workers across machines, version multiple
+models, or export a full metrics/tracing backend. For a public deployment, add an
+authenticated gateway with request/body limits and TLS. Model memory is duplicated
+per worker. The queue limit controls inference work, while ingress connections
+and request parsing still need limits at the gateway.
+
+See [the engineering review](docs/engineering-review.md) for the findings and
+prioritized follow-up work.

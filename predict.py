@@ -8,7 +8,6 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 
 import requests
@@ -38,9 +37,13 @@ def predict_one(url: str, rng=None) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Call the /predict endpoint")
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
-    parser.add_argument("--port", default=8080, type=int, help="Server port (default: 8080)")
-    parser.add_argument("--n", default=1, type=int, help="Number of predictions to send (default: 1)")
+    parser.add_argument("--port", default=8000, type=int, help="Server port (default: 8000)")
+    parser.add_argument(
+        "--n", default=1, type=int, help="Number of predictions to send (default: 1)"
+    )
     args = parser.parse_args()
+    if args.n < 1:
+        parser.error("--n must be positive")
 
     url = f"http://{args.host}:{args.port}/predict"
 
@@ -50,15 +53,17 @@ def main():
     for i in range(args.n):
         try:
             result = predict_one(url)
-        except requests.ConnectionError:
-            print(f"[ERROR] Could not connect to {url}")
-            print("   Make sure the server is running:  uvicorn server:app --host 127.0.0.1 --port 8080")
+        except requests.RequestException as exc:
+            print(f"[ERROR] Request to {url} failed: {exc}")
+            print(
+                "   Make sure the server is running: uvicorn server:app --host 127.0.0.1 --port 8000"
+            )
             sys.exit(1)
 
         correct += result["correct"]
         tick = "[OK]" if result["correct"] else "[WRONG]"
         print(
-            f"[{i+1}/{args.n}] {tick}  "
+            f"[{i + 1}/{args.n}] {tick}  "
             f"Predicted: {result['predicted_class']:22s}  "
             f"Actual: {result['true_class']:22s}  "
             f"Confidence: {result['confidence']:.1%}  "
@@ -68,7 +73,7 @@ def main():
         )
 
     if args.n > 1:
-        print(f"\n[SUMMARY] Accuracy: {correct}/{args.n} ({correct/args.n:.0%})")
+        print(f"\n[SUMMARY] Accuracy: {correct}/{args.n} ({correct / args.n:.0%})")
 
 
 if __name__ == "__main__":
