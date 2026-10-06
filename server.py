@@ -1,90 +1,122 @@
-"""
-server.py
-
-FastAPI HTTP frontend for the distributed inference service.
-Configurations are loaded from environment variables.
-"""
+"""Validated HTTP API with bounded asynchronous inference and explicit readiness."""
 
 import asyncio
+import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Annotated
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from dispatcher import Dispatcher
+from dispatcher import Dispatcher, InferenceError, ServiceUnavailable
 from model import IMG_SIZE
 
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
-ENABLE_BATCHING = os.environ.get("ENABLE_BATCHING", "1") == "1"
-MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "16"))
-BATCH_WINDOW_MS = float(os.environ.get("BATCH_WINDOW_MS", "8.0"))
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Distributed Model-Serving System")
-dispatcher: Dispatcher | None = None
+
+@asynccontextmanager
+async def lifespan(app):
+    batching = os.environ.get("ENABLE_BATCHING", "1")
+    if batching not in {"0", "1"}:
+        raise ValueError("ENABLE_BATCHING must be 0 or 1")
+    timeout = float(os.environ.get("REQUEST_TIMEOUT_S", "5"))
+    if not np.isfinite(timeout) or timeout <= 0:
+        raise ValueError("REQUEST_TIMEOUT_S must be finite and positive")
+    app.state.request_timeout_s = timeout
+    app.state.dispatcher = await asyncio.to_thread(
+        Dispatcher,
+        num_workers=int(os.environ.get("NUM_WORKERS", "4")),
+        enable_batching=batching == "1",
+        max_batch_size=int(os.environ.get("MAX_BATCH_SIZE", "16")),
+        batch_window_ms=float(os.environ.get("BATCH_WINDOW_MS", "8")),
+        max_pending_requests=int(os.environ.get("MAX_PENDING_REQUESTS", "256")),
+        startup_timeout_s=float(os.environ.get("STARTUP_TIMEOUT_S", "30")),
+        torch_threads=int(os.environ.get("TORCH_THREADS", "1")),
+        worker_timeout_s=float(os.environ.get("WORKER_TIMEOUT_S", "30")),
+    )
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(app.state.dispatcher.shutdown)
+        app.state.dispatcher = None
+
+
+app = FastAPI(title="ParallelServe", lifespan=lifespan)
+Pixel = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False, strict=True)]
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    # Raw JSON NaN/Infinity values must not cause a second serialization error
+    # while rendering the validation error. Also avoid echoing entire images.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {key: error[key] for key in ("type", "loc", "msg")} for error in exc.errors()
+            ]
+        },
+    )
 
 
 class PredictRequest(BaseModel):
-    # Flat list of IMG_SIZE * IMG_SIZE floats in [0, 1].
-    pixels: list[float]
-
-
-@app.on_event("startup")
-def _startup():
-    global dispatcher
-
-    # dispatcher.predict() is a blocking call. We use a custom ThreadPoolExecutor
-    # sized to the maximum expected concurrency (256) to prevent the default 
-    # asyncio thread pool from bottlenecking the async event loop during IPC waits.
-    loop = asyncio.get_event_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=256))
-
-    print(
-        f"[server] starting dispatcher: workers={NUM_WORKERS} "
-        f"batching={ENABLE_BATCHING} max_batch={MAX_BATCH_SIZE} "
-        f"window_ms={BATCH_WINDOW_MS}"
-    )
-    dispatcher = Dispatcher(
-        num_workers=NUM_WORKERS,
-        max_batch_size=MAX_BATCH_SIZE,
-        batch_window_ms=BATCH_WINDOW_MS,
-        enable_batching=ENABLE_BATCHING,
-    )
-
-
-@app.on_event("shutdown")
-def _shutdown():
-    if dispatcher:
-        dispatcher.shutdown()
+    pixels: list[Pixel] = Field(min_length=IMG_SIZE * IMG_SIZE, max_length=IMG_SIZE * IMG_SIZE)
 
 
 @app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "workers": dispatcher.worker_count() if dispatcher else 0,
-        "batching_enabled": ENABLE_BATCHING,
-    }
+async def health():
+    dispatcher = getattr(app.state, "dispatcher", None)
+    stats = (
+        dispatcher.stats()
+        if dispatcher
+        else {
+            "workers": 0,
+            "configured_workers": 0,
+            "pending_requests": 0,
+            "max_pending_requests": 0,
+        }
+    )
+    ready = stats["workers"] > 0
+    status = (
+        ("ok" if stats["workers"] == stats["configured_workers"] else "degraded")
+        if ready
+        else "unavailable"
+    )
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": status,
+            **stats,
+            "batching_enabled": dispatcher.enable_batching if dispatcher else False,
+        },
+    )
+
+
+@app.get("/live")
+async def live():
+    return {"status": "ok"}
 
 
 @app.post("/predict")
 async def predict(req: PredictRequest):
-    if len(req.pixels) != IMG_SIZE * IMG_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Expected {IMG_SIZE * IMG_SIZE} pixel values, got {len(req.pixels)}",
-        )
-    array = np.array(req.pixels, dtype=np.float32).reshape(1, IMG_SIZE, IMG_SIZE)
-
-    loop = asyncio.get_event_loop()
-    # Run the blocking dispatcher.predict() in a separate thread
-    # to avoid blocking the asyncio event loop.
-    def _run():
-        return dispatcher.predict(array)
-
+    dispatcher = getattr(app.state, "dispatcher", None)
+    if dispatcher is None:
+        raise HTTPException(503, "Inference service is unavailable")
+    array = np.asarray(req.pixels, dtype=np.float32).reshape(1, IMG_SIZE, IMG_SIZE)
     start = time.perf_counter()
-    result = await loop.run_in_executor(None, _run)
-    result["total_latency_ms"] = round((time.perf_counter() - start) * 1000.0, 3)
+    try:
+        result = await dispatcher.predict_async(array, app.state.request_timeout_s)
+    except ServiceUnavailable as exc:
+        raise HTTPException(503, str(exc), headers={"Retry-After": "1"}) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, "Prediction deadline exceeded") from exc
+    except InferenceError as exc:
+        logger.exception("Inference failed")
+        raise HTTPException(500, "Model inference failed") from exc
+    result["total_latency_ms"] = round((time.perf_counter() - start) * 1000, 3)
     return result

@@ -10,6 +10,7 @@ stripes, vertical stripes, diagonal gradient, checkerboard) plus noise.
 """
 
 import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,7 +18,9 @@ import torch.nn.functional as F
 
 IMG_SIZE = 28
 NUM_CLASSES = 4
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model_weights.pt")
+MODEL_PATH = os.path.abspath(
+    os.environ.get("MODEL_PATH", os.path.join(os.path.dirname(__file__), "model_weights.pt"))
+)
 
 
 class TinyCNN(nn.Module):
@@ -33,8 +36,8 @@ class TinyCNN(nn.Module):
         self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))   # 28x28 -> 14x14
-        x = self.pool(F.relu(self.conv2(x)))   # 14x14 -> 7x7
+        x = self.pool(F.relu(self.conv1(x)))  # 28x28 -> 14x14
+        x = self.pool(F.relu(self.conv2(x)))  # 14x14 -> 7x7
         x = x.reshape(x.size(0), -1)
         x = F.relu(self.fc1(x))
         return self.fc2(x)
@@ -80,6 +83,8 @@ def generate_dataset(n_per_class: int = 500, seed: int = 42):
 
 
 def train_and_save(epochs: int = 8, batch_size: int = 32, lr: float = 1e-3):
+    torch.manual_seed(42)
+    torch.set_num_threads(int(os.environ.get("TORCH_THREADS", "1")))
     images, labels = generate_dataset()
     split = int(0.85 * len(labels))
     x_train = torch.tensor(images[:split])
@@ -110,10 +115,7 @@ def train_and_save(epochs: int = 8, batch_size: int = 32, lr: float = 1e-3):
         with torch.no_grad():
             val_out = model(x_val)
             val_acc = (val_out.argmax(dim=1) == y_val).float().mean().item()
-        print(
-            f"epoch {epoch + 1}/{epochs}  "
-            f"train_loss={total_loss / n:.4f}  val_acc={val_acc:.3f}"
-        )
+        print(f"epoch {epoch + 1}/{epochs}  train_loss={total_loss / n:.4f}  val_acc={val_acc:.3f}")
 
     torch.save(model.state_dict(), MODEL_PATH)
     print(f"Saved trained weights to {MODEL_PATH}")
@@ -122,7 +124,11 @@ def train_and_save(epochs: int = 8, batch_size: int = 32, lr: float = 1e-3):
 
 def load_model() -> TinyCNN:
     model = TinyCNN()
-    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model weights missing at {MODEL_PATH}. Run python model.py first."
+        )
+    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu", weights_only=True))
     model.eval()
     return model
 

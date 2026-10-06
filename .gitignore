@@ -3,3 +3,8 @@ __pycache__/
 *.pt
 *.pth
 .env
+.venv/
+.pytest_cache/
+.ruff_cache/
+benchmarks/results/
+.test-tmp/
